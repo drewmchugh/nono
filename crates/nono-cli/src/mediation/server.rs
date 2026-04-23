@@ -13,7 +13,7 @@ use super::approval::ApprovalGate;
 use super::broker::TokenBroker;
 use super::policy::{admin_passthrough, apply, ShimRequest, ShimResponse};
 use super::session::ResolvedCommand;
-use super::AuditEvent;
+use super::{AuditEvent, SessionAuditInfo};
 use nix::libc;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -42,6 +42,7 @@ pub async fn run(
     audit_socket_path: PathBuf,
     audit_log_dir: PathBuf,
     workdir: PathBuf,
+    audit_info: Arc<SessionAuditInfo>,
 ) -> std::io::Result<()> {
     // Remove stale socket file if present
     let _ = std::fs::remove_file(&socket_path);
@@ -57,8 +58,9 @@ pub async fn run(
     match bind_dgram_owner_only(&audit_socket_path) {
         Ok(audit_socket) => {
             let audit_log_dir_arc = Arc::clone(&audit_log_dir);
+            let audit_info_arc = Arc::clone(&audit_info);
             tokio::spawn(async move {
-                run_audit_receiver(audit_socket, audit_log_dir_arc).await;
+                run_audit_receiver(audit_socket, audit_log_dir_arc, audit_info_arc).await;
             });
             debug!(
                 "Audit datagram socket listening on {}",
@@ -90,6 +92,7 @@ pub async fn run(
                 let sess_dir = Arc::clone(&audit_log_dir);
                 let admin_rx = admin_state.subscribe();
                 let gate = Arc::clone(&approval);
+                let stamp = Arc::clone(&audit_info);
                 tokio::spawn(async move {
                     if let Err(e) = handle_connection(
                         stream,
@@ -102,6 +105,7 @@ pub async fn run(
                         gate,
                         &sess_dir,
                         &wd,
+                        &stamp,
                     )
                     .await
                     {
@@ -130,6 +134,7 @@ async fn handle_connection(
     approval: Arc<dyn ApprovalGate + Send + Sync>,
     audit_log_dir: &Path,
     workdir: &std::path::Path,
+    audit_info: &SessionAuditInfo,
 ) -> std::io::Result<()> {
     // Read length-prefixed request. Reject oversized payloads before allocating
     // to prevent a rogue same-user process from causing a large allocation.
@@ -179,6 +184,7 @@ async fn handle_connection(
             request.args,
             std::process::id()
         );
+        let command_pid = request.pid;
         let (response, action_type) = admin_passthrough(&request, commands).await;
         write_response(&mut stream, &response).await?;
         log_mediated_audit(
@@ -187,12 +193,15 @@ async fn handle_connection(
             &request.args,
             &response,
             action_type,
+            Some(command_pid),
+            audit_info,
         );
         return Ok(());
     }
 
     let command_name = request.command.clone();
     let args = request.args.clone();
+    let command_pid = request.pid;
     let ctx = super::policy::SessionCtx {
         shim_dir,
         socket_path,
@@ -202,7 +211,7 @@ async fn handle_connection(
     let (response, action_type) = apply(request, commands, broker, &ctx, approval).await;
 
     write_response(&mut stream, &response).await?;
-    log_mediated_audit(audit_log_dir, &command_name, &args, &response, action_type);
+    log_mediated_audit(audit_log_dir, &command_name, &args, &response, action_type, Some(command_pid), audit_info);
     Ok(())
 }
 
@@ -213,6 +222,8 @@ fn log_mediated_audit(
     args: &[String],
     response: &ShimResponse,
     action_type: &str,
+    command_pid: Option<u32>,
+    audit_info: &SessionAuditInfo,
 ) {
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -226,6 +237,11 @@ fn log_mediated_audit(
             ts,
             exit_code: response.exit_code,
             action_type: Some(action_type.to_string()),
+            session_id: audit_info.session_id.clone(),
+            session_name: audit_info.session_name.clone(),
+            nono_pid: audit_info.nono_pid,
+            sandboxed_pid: audit_info.sandboxed_pid.get().copied(),
+            command_pid,
         },
     );
 }
@@ -291,13 +307,25 @@ fn bind_dgram_owner_only(path: &Path) -> std::io::Result<tokio::net::UnixDatagra
 }
 
 /// Receive audit events from shims and append them to `audit.jsonl`.
-async fn run_audit_receiver(socket: tokio::net::UnixDatagram, audit_log_dir: Arc<PathBuf>) {
+///
+/// Shim-originated events do not carry session context (the shim has no
+/// access to it). The server stamps each received event with the session
+/// fields before writing to disk.
+async fn run_audit_receiver(
+    socket: tokio::net::UnixDatagram,
+    audit_log_dir: Arc<PathBuf>,
+    audit_info: Arc<SessionAuditInfo>,
+) {
     let mut buf = vec![0u8; 8192];
     loop {
         match socket.recv(&mut buf).await {
             Ok(n) => {
                 if let Ok(mut event) = serde_json::from_slice::<AuditEvent>(&buf[..n]) {
                     event.args = scrub_args(&event.args);
+                    event.session_id = audit_info.session_id.clone();
+                    event.session_name = audit_info.session_name.clone();
+                    event.nono_pid = audit_info.nono_pid;
+                    event.sandboxed_pid = audit_info.sandboxed_pid.get().copied();
                     append_audit_log(&audit_log_dir, &event);
                 } else {
                     warn!("audit socket: failed to parse event");

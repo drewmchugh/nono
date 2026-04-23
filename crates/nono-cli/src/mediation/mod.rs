@@ -21,6 +21,8 @@ pub mod policy;
 pub mod server;
 pub mod session;
 
+use std::sync::{Arc, OnceLock};
+
 use serde::{Deserialize, Serialize};
 
 /// Top-level mediation configuration from a profile's `mediation` section.
@@ -164,10 +166,32 @@ pub struct NetworkConfig {
     pub allowed_hosts: Vec<String>,
 }
 
+/// Session context stamped onto every audit event.
+///
+/// Constructed once in `execution_runtime` before the sandbox is applied and
+/// threaded through to the mediation server. `sandboxed_pid` is filled in via the
+/// latch after the sandboxed agent process is forked.
+#[derive(Clone)]
+pub struct SessionAuditInfo {
+    pub session_id: String,
+    pub session_name: Option<String>,
+    /// PID of the nono process itself (the unsandboxed supervisor).
+    pub nono_pid: u32,
+    /// Filled in once the sandboxed agent is forked; reads as `None` before that.
+    pub sandboxed_pid: Arc<OnceLock<u32>>,
+}
+
 /// Audit event for command logging.
 ///
-/// Used by both shim-originated fire-and-forget events (audit mode) and
-/// server-side response logging (mediated mode).
+/// Process hierarchy per log entry:
+///   `nono_pid`    — the nono sandbox process (unsandboxed supervisor)
+///   `sandboxed_pid` — the sandboxed child process (e.g. claude, codex), direct child of nono
+///   `command_pid`   — the shim process that executed the logged command
+///                     (e.g. the process running "echo" or "git"), child of the sandboxed process
+///
+/// The session/process fields use `#[serde(default)]` so that older shim-
+/// originated datagrams (which do not include them) still deserialize cleanly;
+/// the server stamps the session/nono/sandboxed fields after deserialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditEvent {
     /// The command name (basename of argv[0]).
@@ -182,6 +206,22 @@ pub struct AuditEvent {
     /// Only set for mediated commands; absent for audit-mode commands.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_type: Option<String>,
+    /// Session ID from the nono session registry (`~/.nono/sessions/{id}.json`).
+    #[serde(default)]
+    pub session_id: String,
+    /// Human-readable session name (from `--name` or auto-generated).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    /// PID of the nono process (the unsandboxed supervisor).
+    #[serde(default)]
+    pub nono_pid: u32,
+    /// PID of the sandboxed child process (e.g. claude, codex). `None` until after fork.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandboxed_pid: Option<u32>,
+    /// PID of the shim process that ran this specific command (e.g. the process
+    /// that executed "echo" or "git"). Child of the agent process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_pid: Option<u32>,
 }
 
 /// Environment variable policy for the sandboxed child process.

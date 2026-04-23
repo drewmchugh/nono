@@ -5,6 +5,8 @@ use crate::rollback_runtime::{
     create_audit_state, finalize_supervised_exit, initialize_rollback_state,
     warn_if_rollback_flags_ignored, AuditState, RollbackExitContext,
 };
+use std::sync::{Arc, OnceLock};
+
 use crate::{
     exec_strategy, output, protected_paths, pty_proxy, session, terminal_approval, trust_intercept,
     DETACHED_SESSION_ID_ENV,
@@ -29,6 +31,12 @@ pub(crate) struct SupervisedRuntimeContext<'a> {
     pub(crate) proxy: &'a ProxyLaunchOptions,
     pub(crate) proxy_handle: Option<&'a nono_proxy::server::ProxyHandle>,
     pub(crate) silent: bool,
+    /// Pre-generated session ID from execution_runtime, shared with the mediation audit log.
+    pub(crate) pre_session_id: Option<String>,
+    /// Pre-generated session name from execution_runtime, shared with the mediation audit log.
+    pub(crate) pre_session_name: Option<String>,
+    /// Latch to fill in with the sandboxed process PID once forked; shared with the mediation server.
+    pub(crate) mediation_sandboxed_pid_latch: Option<Arc<OnceLock<u32>>>,
 }
 
 fn build_supervisor_session_id(audit_state: Option<&AuditState>) -> String {
@@ -77,20 +85,29 @@ fn create_session_runtime_state(
     caps: &CapabilitySet,
     session: &SessionLaunchOptions,
     audit_state: Option<&AuditState>,
+    pre_session_id: Option<String>,
+    pre_session_name: Option<String>,
 ) -> Result<SessionRuntimeState> {
     let started = chrono::Local::now().to_rfc3339();
-    let short_session_id = std::env::var(DETACHED_SESSION_ID_ENV)
-        .ok()
-        .filter(|id| !id.is_empty())
-        .unwrap_or_else(session::generate_session_id);
+    // Use pre-generated ID when available (shares the value with the mediation
+    // audit log). Fall back to DETACHED env var or a fresh random ID.
+    let short_session_id = pre_session_id.unwrap_or_else(|| {
+        std::env::var(DETACHED_SESSION_ID_ENV)
+            .ok()
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(session::generate_session_id)
+    });
+    // Use pre-generated name when available; it was already resolved from
+    // session.session_name with the same fallback logic.
+    let resolved_name = pre_session_name.unwrap_or_else(|| {
+        session
+            .session_name
+            .clone()
+            .unwrap_or_else(session::generate_random_name)
+    });
     let session_record = session::SessionRecord {
         session_id: short_session_id.clone(),
-        name: Some(
-            session
-                .session_name
-                .clone()
-                .unwrap_or_else(session::generate_random_name),
-        ),
+        name: Some(resolved_name),
         supervisor_pid: std::process::id(),
         child_pid: 0,
         started: started.clone(),
@@ -138,6 +155,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         proxy,
         proxy_handle,
         silent,
+        pre_session_id,
+        pre_session_name,
+        mediation_sandboxed_pid_latch,
     } = ctx;
 
     output::print_applying_sandbox(silent);
@@ -152,8 +172,14 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
     // until after the baseline walk, the 30-second startup timeout can fire
     // before the session becomes attachable.
     let trust_interceptor = create_trust_interceptor(trust);
-    let session_runtime =
-        create_session_runtime_state(command, caps, session, audit_state.as_ref())?;
+    let session_runtime = create_session_runtime_state(
+        command,
+        caps,
+        session,
+        audit_state.as_ref(),
+        pre_session_id,
+        pre_session_name,
+    )?;
     let SessionRuntimeState {
         started,
         short_session_id,
@@ -195,6 +221,9 @@ pub(crate) fn execute_supervised_runtime(ctx: SupervisedRuntimeContext<'_>) -> R
         let mut on_fork = |child_pid: u32| {
             if let Some(ref mut guard) = session_guard {
                 guard.set_child_pid(child_pid);
+            }
+            if let Some(ref latch) = mediation_sandboxed_pid_latch {
+                let _ = latch.set(child_pid);
             }
         };
         exec_strategy::execute_supervised(

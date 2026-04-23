@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 use zeroize::Zeroizing;
 
 /// Request forwarded from the shim binary to the mediation server.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ShimRequest {
     pub command: String,
     pub args: Vec<String>,
@@ -35,6 +35,10 @@ pub struct ShimRequest {
     /// Used only for nonce promotion — all non-nonce vars are discarded.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// PID of the shim process itself — the process that ran this command.
+    /// Used to populate `command_pid` in the audit log.
+    #[serde(default)]
+    pub pid: u32,
 }
 
 /// Response the mediation server sends back to the shim binary.
@@ -1016,7 +1020,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let (resp, _action_type) = apply(
             req,
@@ -1058,7 +1062,7 @@ mod tests {
             ],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let (resp, _action_type) = apply(
             req,
@@ -1093,7 +1097,7 @@ mod tests {
             args: vec!["auth".to_string(), "github".to_string()],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let (resp, _action_type) = apply(
             req,
@@ -1128,7 +1132,7 @@ mod tests {
             args: vec!["status".to_string()],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         // Falls through to passthrough exec of /usr/bin/true
         let (resp, _action_type) = apply(
@@ -1163,7 +1167,7 @@ mod tests {
             args: vec!["repo".to_string(), "delete".to_string()],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let (resp, _action_type) = apply(
             req,
@@ -1198,7 +1202,7 @@ mod tests {
             args: vec!["repo".to_string(), "delete".to_string()],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let (resp, _action_type) = apply(
             req,
@@ -1234,7 +1238,7 @@ mod tests {
             args: vec!["status".to_string()],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let (resp, _action_type) = apply(
             req,
@@ -1352,7 +1356,7 @@ mod tests {
             args: vec!["auth".to_string(), "hello".to_string()],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let broker = make_broker();
         let (resp, _action_type) = apply(
@@ -1396,7 +1400,7 @@ mod tests {
             args: vec!["auth".to_string()],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
         let broker = make_broker();
         let (resp, _action_type) = apply(
@@ -1627,7 +1631,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
 
         let broker = make_broker();
@@ -1712,7 +1716,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
 
         let broker = make_broker();
@@ -1775,7 +1779,7 @@ mod tests {
             args: vec![],
             stdin: String::new(),
             session_token: String::new(),
-            env: HashMap::new(),
+            ..Default::default()
         };
 
         let broker = make_broker();
