@@ -12,6 +12,8 @@
 
 mod env_sanitization;
 #[cfg(target_os = "linux")]
+mod exec_filter_shepherd;
+#[cfg(target_os = "linux")]
 mod supervisor_linux;
 
 use crate::startup_prompt::{print_terminal_safe_stderr, prompt_startup_termination_for_child};
@@ -1204,6 +1206,22 @@ pub fn execute_supervised(
             // tries to send the handshake.
             if let Some(ref mut p) = pty_proxy {
                 p.shutdown_attach_listener();
+            }
+
+            // Hand the exec-filter listener fd off to a detached shepherd
+            // before it falls out of scope. The user's command may have
+            // spawned long-lived daemons (notably bazel-server, double-
+            // forked away by bzl) that inherited our seccomp filter. If we
+            // close the listener now, the kernel sets `filter->notif = NULL`
+            // and every subsequent `execve` from those orphans returns
+            // ENOSYS — the JVM `posix_spawn failed, error: 38` failure mode.
+            // The shepherd allows traps unconditionally until the last
+            // task with the filter exits (POLLHUP on the listener), then
+            // exits cleanly. See exec_strategy/exec_filter_shepherd.rs and
+            // docs/jvm-enosys-investigation.md.
+            #[cfg(target_os = "linux")]
+            if let Some(ref fd) = exec_notify_fd {
+                exec_filter_shepherd::spawn(fd);
             }
 
             let exit_code = match status {
